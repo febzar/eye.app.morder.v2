@@ -41,6 +41,20 @@ let mainWindow = null;
 let hostServer = null;
 let clientConnection = null;
 
+// ── Logging file untuk auto-host ────────────────────────────────────────────────
+// console.log dari main process Electron sering TIDAK ter-flush ke file saat
+// proses dijalankan detached/GUI di Windows (windowsHide), sehingga morderx-host.log
+// kosong dan mustahil didiagnosis. Karena itu mode auto-host menulis status &
+// error capture langsung ke file dengan fs.appendFileSync.
+const HOST_LOG_PATH = path.join(__dirname, '..', 'morderx-host.log');
+function hostLog(msg) {
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  try { fs.appendFileSync(HOST_LOG_PATH, line); } catch {}
+  try { process.stdout.write(line); } catch {}
+}
+process.on('uncaughtException', (err) => hostLog(`uncaughtException: ${err && err.stack || err}`));
+process.on('unhandledRejection', (err) => hostLog(`unhandledRejection: ${err && err.stack || err}`));
+
 // ────────────────────────────────────────────────────────────────────────────
 // App Lifecycle
 // ────────────────────────────────────────────────────────────────────────────
@@ -93,10 +107,11 @@ function startAutoHost() {
   if (process.platform === 'darwin' && app.dock) app.dock.hide();
 
   const ips = getLocalIPs();
-  console.log('\n=== Morderx Auto-Host Broadcaster (WebRTC) ===');
-  console.log(`Menyiarkan ke server signaling di port ${autoPort}`);
-  ips.forEach(({ address }) => console.log(`Client : http://${address}:${autoPort}`));
-  console.log('Pastikan "node server.js" berjalan (server + input).\n');
+  hostLog('=== Morderx Auto-Host Broadcaster (WebRTC) ===');
+  hostLog(`Electron ${process.versions.electron} / Chromium ${process.versions.chrome} / Node ${process.versions.node}`);
+  hostLog(`Platform ${process.platform} ${os.release()} — menyiarkan ke port ${autoPort}`);
+  ips.forEach(({ address }) => hostLog(`Client : http://${address}:${autoPort}`));
+  hostLog('Pastikan "node server.js" berjalan (server + input).');
 
   // Jendela tersembunyi yang menangkap layar & menyiarkan.
   const win = new BrowserWindow({
@@ -110,6 +125,17 @@ function startAutoHost() {
       backgroundThrottling: false,
     },
   });
+
+  // Diagnostik: tangkap semua sinyal hidup/mati renderer & GPU ke morderx-host.log.
+  const wc = win.webContents;
+  wc.on('console-message', (_e, _level, message) => hostLog(`[renderer] ${message}`));
+  wc.on('did-finish-load', () => hostLog('autohost.html selesai dimuat'));
+  wc.on('did-fail-load', (_e, code, desc) => hostLog(`did-fail-load: ${code} ${desc}`));
+  wc.on('render-process-gone', (_e, d) => hostLog(`render-process-gone: ${d.reason} (exitCode ${d.exitCode})`));
+  wc.on('unresponsive', () => hostLog('renderer unresponsive'));
+  app.on('child-process-gone', (_e, d) => hostLog(`child-process-gone: ${d.type}/${d.name || ''} ${d.reason} (exitCode ${d.exitCode})`));
+  win.on('closed', () => hostLog('jendela broadcaster closed'));
+
   win.loadFile(path.join(__dirname, 'renderer', 'autohost.html'), {
     query: { port: String(autoPort), password: autoPassword },
   });
@@ -351,10 +377,16 @@ ipcMain.handle('get-hostname', () => os.hostname());
 // IPC Handlers — Screen Capture Sources (WebRTC)
 // ────────────────────────────────────────────────────────────────────────────
 ipcMain.handle('get-desktop-sources', async () => {
-  const sources = await desktopCapturer.getSources({ types: ['screen'], fetchWindowThumbnails: false });
-  return sources.map(s => ({ id: s.id, name: s.name }));
+  try {
+    const sources = await desktopCapturer.getSources({ types: ['screen'], fetchWindowThumbnails: false });
+    hostLog(`get-desktop-sources: ${sources.length} sumber [${sources.map(s => s.name).join(', ')}]`);
+    return sources.map(s => ({ id: s.id, name: s.name }));
+  } catch (err) {
+    hostLog(`get-desktop-sources ERROR: ${err && err.message || err}`);
+    throw err;
+  }
 });
 
 ipcMain.on('auto-host-status', (_, msg) => {
-  console.log(`[AUTO-HOST] ${msg}`);
+  hostLog(`[AUTO-HOST] ${msg}`);
 });
