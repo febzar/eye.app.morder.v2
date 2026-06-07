@@ -14,6 +14,25 @@ Mendukung macOS, Windows, dan Linux.
 
 ---
 
+## 📋 Persyaratan Sistem
+
+| Komponen | Minimum | Catatan |
+|---|---|---|
+| **Node.js** | **≥ 20.19 atau ≥ 22.12** (disarankan **24 LTS**) | Installer Electron memuat `@electron/get` yang berformat **ESM**. Node lama (mis. 18, atau 22.9) gagal dengan `ERR_REQUIRE_ESM` saat mengunduh binary Electron. Cek: `node -v`. |
+| **OS host** | Windows 10/11, macOS 11+, Linux (Chromium) | Input (robotjs) & capture berjalan di sisi host. |
+| **Capture app "mode kiosk"/fullscreen (Windows)** | **Windows 11 24H2 — build ≥ 26100** | Wajib agar Chromium memakai **Windows Graphics Capture (WGC)** yang menangkap konten hardware-overlay/fullscreen. Versi lebih lama → viewer **hitam/freeze**. Cek dengan `winver`. |
+| **Browser klien** | Chromium-based (Chrome/Edge) | Halaman host butuh secure context (`localhost`). |
+
+> ⚠️ **Penyebab error instalasi #1 adalah versi Node terlalu lama.** Jalankan
+> `node -v` sebelum `npm install`. Kalau di bawah 20.19 / 22.12, update dari
+> <https://nodejs.org> (pilih **LTS**) lebih dulu.
+
+> ℹ️ **Mode Browser tidak butuh Electron sama sekali** (cukup `node server.js`).
+> Binary Electron hanya diperlukan untuk **Mode Desktop** dan **Auto-Host**. Jika
+> hanya memakai mode browser, masalah unduhan Electron di bawah tidak relevan.
+
+---
+
 ## ✨ Fitur
 
 - **Screen Sharing WebRTC** — video real-time 30–60 FPS, latensi rendah (peer-to-peer)
@@ -63,6 +82,10 @@ sinyal kecil; beban capture/encode pindah ke engine browser yang ber-akselerasi 
 ## 🚀 Mode Browser (paling cepat dipakai)
 
 ### 1. Install dependensi (sekali saja)
+
+> **Cek dulu:** `node -v` harus **≥ 20.19 / ≥ 22.12** (disarankan **24 LTS**).
+> Node lebih lama gagal memasang binary Electron (`ERR_REQUIRE_ESM`). Lihat
+> [Persyaratan Sistem](#-persyaratan-sistem).
 
 ```bash
 npm install
@@ -294,6 +317,85 @@ open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapt
 | `robotjs not available` | Install build tools lalu `npm install robotjs` |
 | Tidak bisa konek dari client | Pastikan satu WiFi/LAN dan cek firewall |
 | FPS rendah / patah-patah | Tutup aplikasi berat; turunkan `maxFrameRate`/resolusi di sumber capture |
+| `Error [ERR_REQUIRE_ESM]` saat install/menjalankan | Node terlalu lama. Update ke **Node ≥ 22.12 / 24 LTS** (`node -v`), lalu `npm install` ulang. |
+| `Downloading Electron binary...` berulang, broadcaster tak jalan, `morderx-host.log` kosong | `electron.exe` gagal terpasang. Lihat **[Masalah instalasi Electron](#-masalah-instalasi-electron-mode-desktop--auto-host)**. |
+| Viewer hitam/freeze saat host buka app kiosk/fullscreen | Host harus **Windows 11 24H2+** (WGC). Lihat **[Viewer hitam saat app kiosk](#-viewer-hitamfreeze-saat-host-membuka-aplikasi-mode-kiosk)**. |
+| Auto-host: viewer "menunggu host membagikan layar" | Broadcaster tidak capture. Cek `morderx-host.log` — biasanya `electron.exe` tak terpasang atau capture gagal. |
+
+---
+
+### 🔧 Masalah instalasi Electron (Mode Desktop / Auto-Host)
+
+> Hanya relevan untuk **Mode Desktop** & **Auto-Host**. Mode Browser tidak butuh Electron.
+
+**Gejala:** `npm run serve:auto*` / `npm start` menampilkan `Downloading Electron
+binary...` berulang, broadcaster tak pernah hidup, `Get-Process electron` kosong,
+dan `morderx-host.log` kosong. **Akar masalah:** `electron.exe` tidak ada di
+`node_modules/electron/dist`.
+
+**1. Pastikan Node cukup baru** (penyebab paling sering):
+```bash
+node -v   # harus >= 20.19 atau >= 22.12 (disarankan 24 LTS)
+```
+Node 18 / 22.9 → `ERR_REQUIRE_ESM` saat unduh binary. Update Node, lalu `npm install` ulang.
+
+**2. Verifikasi binary benar-benar ada:**
+```powershell
+Test-Path node_modules\electron\dist\electron.exe   # harus True
+node_modules\electron\dist\electron.exe --version    # harus cocok dgn package.json
+```
+
+**3. Cache unduhan korup** (gejala: `dist` cuma berisi folder `locales`) → bersihkan & unduh ulang:
+```powershell
+Remove-Item -Recurse -Force node_modules\electron\dist -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\electron\Cache" -ErrorAction SilentlyContinue
+node node_modules\electron\install.js
+Test-Path node_modules\electron\dist\electron.exe
+```
+
+**4. Antivirus / Windows Defender mengkarantina `electron.exe`** (sering — `electron.exe` kerap salah-deteksi). Konfirmasi:
+```powershell
+Get-MpThreatDetection | Sort-Object InitialDetectionTime | Select-Object -Last 5 InitialDetectionTime, Resources
+```
+Jika muncul `electron.exe`, kecualikan folder (PowerShell **Run as administrator**):
+```powershell
+Add-MpPreference -ExclusionPath "C:\path\ke\proyek"
+Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\electron"
+(Get-MpPreference).ExclusionPath   # verifikasi terdaftar
+```
+lalu ulangi langkah 3.
+
+**5. Unduh manual** (paling andal bila jaringan/AV rewel):
+1. Unduh lewat browser: `https://github.com/electron/electron/releases/download/vX.Y.Z/electron-vX.Y.Z-win32-x64.zip`
+   (ganti `X.Y.Z` dengan versi `electron` di `package.json` → `devDependencies`).
+2. Jika Defender mengkarantina unduhan, **Allow/Restore** via *Windows Security → Protection history*.
+3. Ekstrak **seluruh isi** zip ke `node_modules\electron\dist\` (hingga ada `dist\electron.exe`).
+4. `Test-Path node_modules\electron\dist\electron.exe` → `True`.
+
+> Diagnostik broadcaster ditulis ke **`morderx-host.log`** (via `fs.appendFileSync`,
+> bukan `console.log`, karena output GUI Electron tidak ter-flush ke file di Windows).
+> Isinya menampilkan versi Electron, jumlah sumber layar, status capture, dan crash GPU/renderer.
+
+---
+
+### 🖥️ Viewer hitam/freeze saat host membuka aplikasi "mode kiosk"
+
+Aplikasi kiosk/fullscreen berbasis Chromium merender lewat **hardware overlay**
+(DirectComposition / Multiplane Overlay) yang **dilewati** capturer layar biasa
+(DXGI Desktop Duplication) → viewer dapat frame **hitam**; saat fullscreen-exclusive,
+komposisi desktop berhenti di-update → **freeze**.
+
+- **Solusi utama (host Windows):** pakai **Windows 11 24H2 (build ≥ 26100)**. Sejak
+  **Electron 42**, Chromium memakai **Windows Graphics Capture (WGC)** yang menangkap
+  konten overlay/fullscreen dengan benar. Cek build via `winver`. Berlaku untuk
+  auto-host **maupun** share manual (WGC pada browser/Electron yang sama).
+- **WGC butuh GPU** → di Windows 11 24H2 aplikasi **tidak** mematikan akselerasi
+  hardware (lihat logika versi-OS di [src/main.js](src/main.js)); di Windows lama
+  akselerasi tetap dimatikan demi menghindari frame hitam DXGI pada GPU hybrid.
+- **Windows < 24H2 (fallback):** jalankan aplikasi kiosknya dengan flag
+  `--disable-direct-composition` (atau matikan "hardware acceleration" di setelan app
+  tsb), **atau** matikan Multiplane Overlay global: registry
+  `HKLM\SOFTWARE\Microsoft\Windows\Dwm` → DWORD `OverlayTestMode` = `5`, lalu reboot.
 
 ---
 
