@@ -2,23 +2,29 @@
  * Input Execution Module
  * Uses robotjs to execute mouse and keyboard events received from the client.
  * 
- * On Windows, robotjs handles Win32 input simulation natively.
- * Requires: npm install robotjs (needs node-gyp and build tools on Windows)
+ * Pakai @jitsi/robotjs — fork API-kompatibel dengan prebuilt binary untuk
+ * Windows/macOS/Linux, jadi tidak perlu compiler saat install. Pada Windows,
+ * simulasi input ditangani natif lewat Win32.
  */
 
 let robot = null;
 let robotAvailable = false;
 
-// Try to load robotjs
-try {
-  robot = require('robotjs');
-  robot.setMouseDelay(0);
-  robot.setKeyboardDelay(0);
-  robotAvailable = true;
-  console.log('[INPUT] robotjs loaded successfully');
-} catch (err) {
-  console.warn('[INPUT] robotjs not available:', err.message);
-  console.warn('[INPUT] Mouse/keyboard control disabled. Run: npm install robotjs');
+// Coba @jitsi/robotjs (prebuilt) dulu, lalu robotjs lama sebagai cadangan.
+for (const mod of ['@jitsi/robotjs', 'robotjs']) {
+  try {
+    robot = require(mod);
+    robot.setMouseDelay(0);
+    robot.setKeyboardDelay(0);
+    robotAvailable = true;
+    console.log(`[INPUT] ${mod} loaded successfully`);
+    break;
+  } catch (err) {
+    console.warn(`[INPUT] ${mod} not available:`, err.message);
+  }
+}
+if (!robotAvailable) {
+  console.warn('[INPUT] Mouse/keyboard control disabled. Run: npm install @jitsi/robotjs');
 }
 
 /**

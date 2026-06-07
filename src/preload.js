@@ -33,6 +33,12 @@ contextBridge.exposeInMainWorld('morderx', {
   getLocalIPs: () => ipcRenderer.invoke('get-local-ips'),
   getHostname: () => ipcRenderer.invoke('get-hostname'),
 
+  // Screen capture sources (WebRTC)
+  getDesktopSources: () => ipcRenderer.invoke('get-desktop-sources'),
+
+  // Auto-host status report (hidden renderer → main log)
+  autoHostStatus: (msg) => ipcRenderer.send('auto-host-status', msg),
+
   // Event listeners
   onInitMode: (callback) => {
     ipcRenderer.on('init-mode', (_, data) => callback(data));

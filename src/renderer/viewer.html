@@ -111,7 +111,7 @@
       flex: 1; display: flex; align-items: center; justify-content: center;
       background: #080a0e; overflow: hidden; position: relative;
     }
-    #screen-canvas { display: block; max-width: 100%; max-height: 100%; cursor: crosshair; }
+    #screen-video { display: block; max-width: 100%; max-height: 100%; cursor: crosshair; }
 
     /* Placeholder */
     #placeholder {
@@ -200,7 +200,7 @@
       </svg>
       <p>Menunggu frame dari host...</p>
     </div>
-    <canvas id="screen-canvas" style="display:none;"></canvas>
+    <video id="screen-video" style="display:none;" autoplay playsinline muted></video>
   </div>
 </div>
 

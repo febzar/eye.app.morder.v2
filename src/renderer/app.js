@@ -72,6 +72,7 @@ const clientLogEntries = $('client-log-entries');
 // Screen viewer
 const screenPlaceholder = $('screen-placeholder');
 const screenCanvas      = $('screen-canvas');
+const screenVideo       = $('screen-video');
 const viewerControls    = $('viewer-controls');
 const btnToggleInput    = $('btn-toggle-input');
 const viewerFpsDisplay  = $('viewer-fps-display');
@@ -80,7 +81,218 @@ const viewerLatency     = $('viewer-latency-display');
 // ────────────────────────────────────────────────────────────────────────────
 // Canvas context for rendering morderx screen
 // ────────────────────────────────────────────────────────────────────────────
-const ctx = screenCanvas.getContext('2d');
+// ────────────────────────────────────────────────────────────────────────────
+// WebRTC — shared config
+// ────────────────────────────────────────────────────────────────────────────
+const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+// ── Host Broadcaster: capture layar (desktopCapturer) → siarkan ke viewer ──────
+const hostBroadcaster = {
+  ws: null,
+  stream: null,
+  peers: new Map(),   // viewerId -> RTCPeerConnection
+
+  async start(port, password) {
+    // Ambil sumber layar dari main process, lalu capture via getUserMedia.
+    const sources = await api.getDesktopSources();
+    if (!sources || !sources.length) throw new Error('Tidak ada sumber layar terdeteksi');
+
+    this.stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        mandatory: {
+          chromeMediaSource: 'desktop',
+          chromeMediaSourceId: sources[0].id,
+          maxFrameRate: 60,
+        },
+      },
+    });
+
+    await this._connect(port, password);
+  },
+
+  _connect(port, password) {
+    return new Promise((resolve, reject) => {
+      this.ws = new WebSocket(`ws://localhost:${port}`);
+      let settled = false;
+
+      this.ws.addEventListener('message', async (ev) => {
+        let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+        switch (msg.type) {
+          case 'auth-required':
+            this.ws.send(JSON.stringify({ type: 'auth', role: 'host', password }));
+            break;
+          case 'auth-ok':
+            if (!settled) { settled = true; resolve(); }
+            break;
+          case 'auth-failed':
+            if (!settled) { settled = true; reject(new Error('Auth host gagal')); }
+            break;
+          case 'viewer-join':   await this._createPeer(msg.viewerId); break;
+          case 'viewer-leave':  this._closePeer(msg.viewerId); break;
+          case 'signal':        await this._onSignal(msg.viewerId, msg.signal); break;
+        }
+      });
+
+      this.ws.addEventListener('error', () => { if (!settled) { settled = true; reject(new Error('Gagal konek signaling')); } });
+    });
+  },
+
+  async _createPeer(viewerId) {
+    this._closePeer(viewerId);
+    const pc = new RTCPeerConnection(ICE);
+    this.peers.set(viewerId, pc);
+    for (const track of this.stream.getTracks()) pc.addTrack(track, this.stream);
+    pc.onicecandidate = (e) => {
+      if (e.candidate) this.ws.send(JSON.stringify({ type: 'signal', viewerId, signal: { candidate: e.candidate } }));
+    };
+    pc.onconnectionstatechange = () => {
+      if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) this._closePeer(viewerId);
+    };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    this.ws.send(JSON.stringify({ type: 'signal', viewerId, signal: { sdp: pc.localDescription } }));
+  },
+
+  async _onSignal(viewerId, signal) {
+    const pc = this.peers.get(viewerId);
+    if (!pc) return;
+    if (signal.sdp) await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+    else if (signal.candidate) { try { await pc.addIceCandidate(signal.candidate); } catch {} }
+  },
+
+  _closePeer(viewerId) {
+    const pc = this.peers.get(viewerId);
+    if (pc) { pc.close(); this.peers.delete(viewerId); }
+  },
+
+  stop() {
+    for (const pc of this.peers.values()) pc.close();
+    this.peers.clear();
+    if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
+    if (this.ws) { this.ws.close(); this.ws = null; }
+  },
+};
+
+// ── Client Viewer: terima track WebRTC dari host → render ke <video> ───────────
+const clientViewer = {
+  ws: null,
+  pc: null,
+  pingTimer: null,
+  fpsTimer: null,
+  onConnected: null,
+  onDisconnected: null,
+
+  start(host, port, password) {
+    return new Promise((resolve, reject) => {
+      this.ws = new WebSocket(`ws://${host}:${port}`);
+      let settled = false;
+      const fail = (e) => { if (!settled) { settled = true; reject(e); } };
+
+      this.ws.addEventListener('message', async (ev) => {
+        let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+        switch (msg.type) {
+          case 'auth-required':
+            this.ws.send(JSON.stringify({ type: 'auth', role: 'viewer', password }));
+            break;
+          case 'auth-ok':
+            if (!settled) { settled = true; resolve(); }
+            this.pingTimer = setInterval(() => {
+              if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+            }, 3000);
+            break;
+          case 'auth-failed':
+            fail(new Error('Password salah atau autentikasi gagal'));
+            this.ws.close();
+            break;
+          case 'no-host':
+            clientLog('Host belum membagikan layar, menunggu...', 'warn');
+            break;
+          case 'signal':
+            await this._onSignal(msg.signal);
+            break;
+          case 'pong': {
+            const ms = Date.now() - msg.ts;
+            statLatency.textContent = ms + ' ms';
+            viewerLatency.textContent = ms + ' ms';
+            break;
+          }
+        }
+      });
+
+      this.ws.addEventListener('close', () => {
+        this._cleanup();
+        if (this.onDisconnected) this.onDisconnected();
+      });
+      this.ws.addEventListener('error', () => fail(new Error('Tidak dapat terhubung ke host')));
+    });
+  },
+
+  _ensurePeer() {
+    if (this.pc) return this.pc;
+    const pc = new RTCPeerConnection(ICE);
+    this.pc = pc;
+    pc.ontrack = (e) => {
+      screenVideo.srcObject = e.streams[0];
+      screenVideo.play().catch(() => {});
+      if (this.onConnected) this.onConnected();
+      this._startFps();
+    };
+    pc.onicecandidate = (e) => {
+      if (e.candidate) this.ws.send(JSON.stringify({ type: 'signal', signal: { candidate: e.candidate } }));
+    };
+    return pc;
+  },
+
+  async _onSignal(signal) {
+    const pc = this._ensurePeer();
+    if (signal.sdp) {
+      await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+      if (signal.sdp.type === 'offer') {
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        this.ws.send(JSON.stringify({ type: 'signal', signal: { sdp: pc.localDescription } }));
+      }
+    } else if (signal.candidate) {
+      try { await pc.addIceCandidate(signal.candidate); } catch {}
+    }
+  },
+
+  _startFps() {
+    if (this.fpsTimer) return;
+    if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+      let frames = 0, last = Date.now();
+      const tick = () => {
+        frames++;
+        const now = Date.now();
+        if (now - last >= 1000) {
+          statFps.textContent = frames;
+          viewerFpsDisplay.textContent = frames + ' fps';
+          frames = 0; last = now;
+        }
+        if (this.pc) screenVideo.requestVideoFrameCallback(tick);
+      };
+      this.fpsTimer = true;
+      screenVideo.requestVideoFrameCallback(tick);
+    }
+  },
+
+  sendInput(data) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'input', data }));
+  },
+
+  _cleanup() {
+    if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+    this.fpsTimer = null;
+    if (this.pc) { this.pc.close(); this.pc = null; }
+    screenVideo.srcObject = null;
+  },
+
+  disconnect() {
+    this._cleanup();
+    if (this.ws) { this.ws.close(); this.ws = null; }
+  },
+};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Init
@@ -142,6 +354,18 @@ function setupHostView() {
     const result = await api.hostStart({ port, password });
 
     if (result.success) {
+      // Mulai capture layar + broadcast WebRTC dari renderer.
+      try {
+        await hostBroadcaster.start(port, password);
+      } catch (err) {
+        await api.hostStop();
+        showToast('Gagal capture layar: ' + err.message, 'error');
+        hostLog('Capture gagal: ' + err.message + ' (cek izin Screen Recording)', 'error');
+        btnStartHost.disabled = false;
+        btnStartHost.innerHTML = `<svg viewBox="0 0 20 20"><path d="M5 3l12 7-12 7V3z" fill="currentColor"/></svg> Mulai Hosting`;
+        return;
+      }
+
       state.hostRunning = true;
       state.lastHostPort = port;
       hostStatusDot.className = 'status-indicator running';
@@ -150,7 +374,7 @@ function setupHostView() {
       hostConfig.classList.add('hidden');
       hostInfo.classList.remove('hidden');
       renderHostIPs(result.ips, port);
-      hostLog('Server dimulai pada port ' + port, 'success');
+      hostLog('Server dimulai pada port ' + port + ' — layar dibagikan', 'success');
     } else {
       showToast('Gagal memulai: ' + result.error, 'error');
       hostLog('Error: ' + result.error, 'error');
@@ -161,6 +385,7 @@ function setupHostView() {
 
   // Stop hosting
   btnStopHost.addEventListener('click', async () => {
+    hostBroadcaster.stop();
     await api.hostStop();
     state.hostRunning = false;
     hostStatusDot.className = 'status-indicator';
@@ -244,7 +469,8 @@ function hostLog(msg, type = 'info') {
 function setupClientView() {
   clientBackBtn.addEventListener('click', () => {
     if (state.clientConnected) {
-      api.clientDisconnect();
+      clientViewer.disconnect();
+      setClientDisconnected();
     }
     switchView('launcher');
   });
@@ -266,13 +492,26 @@ function setupClientView() {
     btnConnect.innerHTML = `<span class="spinner"></span> Menghubungkan...`;
     clientLog(`Menghubungkan ke ${host}:${port}...`, 'info');
 
-    const result = await api.clientConnect({ host, port, password });
+    clientViewer.onConnected = () => {
+      screenPlaceholder.classList.add('hidden');
+      screenVideo.classList.remove('hidden');
+    };
+    clientViewer.onDisconnected = () => {
+      if (state.clientConnected) {
+        setClientDisconnected();
+        clientLog('Koneksi terputus', 'warn');
+      }
+    };
 
-    if (result.success) {
-      // Connected state set via event listener
-    } else {
-      showToast(result.error, 'error');
-      clientLog('Gagal: ' + result.error, 'error');
+    try {
+      await clientViewer.start(host, port, password);
+      setClientConnected();
+      clientLog('Terhubung ke host!', 'success');
+      showToast('Berhasil terhubung!', 'success');
+    } catch (err) {
+      showToast(err.message, 'error');
+      clientLog('Gagal: ' + err.message, 'error');
+      clientViewer.disconnect();
       resetConnectBtn();
     }
   });
@@ -290,8 +529,8 @@ function setupClientView() {
   });
 
   // Disconnect
-  btnDisconnect.addEventListener('click', async () => {
-    await api.clientDisconnect();
+  btnDisconnect.addEventListener('click', () => {
+    clientViewer.disconnect();
     setClientDisconnected();
     clientLog('Koneksi diputus oleh pengguna', 'warn');
   });
@@ -302,12 +541,12 @@ function setupClientView() {
     if (state.inputEnabled) {
       btnToggleInput.classList.remove('disabled');
       btnToggleInput.querySelector('span').textContent = 'Kontrol Aktif';
-      screenCanvas.style.cursor = 'crosshair';
+      screenVideo.style.cursor = 'crosshair';
       showToast('Kontrol input diaktifkan', 'success');
     } else {
       btnToggleInput.classList.add('disabled');
       btnToggleInput.querySelector('span').textContent = 'Kontrol Nonaktif';
-      screenCanvas.style.cursor = 'default';
+      screenVideo.style.cursor = 'default';
       showToast('Kontrol input dinonaktifkan', 'info');
     }
   });
@@ -329,7 +568,7 @@ function setClientConnected(count) {
   btnDisconnect.classList.remove('hidden');
   clientStats.classList.remove('hidden');
   screenPlaceholder.classList.add('hidden');
-  screenCanvas.classList.remove('hidden');
+  screenVideo.classList.remove('hidden');
   viewerControls.classList.remove('hidden');
   statStatus.textContent = 'Online';
   statStatus.className = 'stat-value connected-text';
@@ -345,7 +584,7 @@ function setClientDisconnected() {
   statStatus.textContent = 'Offline';
   statStatus.className = 'stat-value';
   screenPlaceholder.classList.remove('hidden');
-  screenCanvas.classList.add('hidden');
+  screenVideo.classList.add('hidden');
   viewerControls.classList.add('hidden');
   removeCanvasInput();
   resetConnectBtn();
@@ -384,14 +623,9 @@ function setupEventListeners() {
   // Host events
   api.onHostEvent((event) => {
     switch (event.type) {
-      case 'client-connected':
+      case 'viewer-count':
         hostClientCount.textContent = event.count;
-        hostLog(`Klien terhubung dari ${event.ip} (total: ${event.count})`, 'success');
-        showToast(`Klien baru terhubung: ${event.ip}`, 'success');
-        break;
-      case 'client-disconnected':
-        hostClientCount.textContent = event.count;
-        hostLog(`Klien terputus dari ${event.ip}`, 'warn');
+        hostLog(`Viewer terhubung: ${event.count}`, event.count > 0 ? 'success' : 'info');
         break;
       case 'error':
         hostLog('Error: ' + event.message, 'error');
@@ -400,109 +634,49 @@ function setupEventListeners() {
     }
   });
 
-  // Client events
-  api.onClientEvent((event) => {
-    switch (event.type) {
-      case 'connected':
-        setClientConnected(event.clientCount);
-        clientLog('Terhubung ke host!', 'success');
-        showToast('Berhasil terhubung!', 'success');
-        break;
-      case 'disconnected':
-        setClientDisconnected();
-        clientLog('Koneksi terputus (code: ' + event.code + ')', 'warn');
-        break;
-      case 'fps':
-        statFps.textContent = event.fps;
-        viewerFpsDisplay.textContent = event.fps + ' fps';
-        break;
-      case 'latency':
-        statLatency.textContent = event.ms + ' ms';
-        viewerLatency.textContent = event.ms + ' ms';
-        break;
-      case 'error':
-        clientLog('Error: ' + event.message, 'error');
-        break;
-    }
-  });
-
-  // Screen frames
-  api.onScreenFrame((frame) => {
-    renderFrame(frame);
-  });
+  // Catatan: koneksi client & frame kini ditangani langsung di renderer
+  // (clientViewer + WebRTC), bukan lewat IPC main process.
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Canvas: Render incoming screen frames
-// ────────────────────────────────────────────────────────────────────────────
-function renderFrame(frame) {
-  const img = new Image();
-  img.onload = () => {
-    // Fit canvas to container while maintaining aspect ratio
-    const container = screenCanvas.parentElement;
-    const containerW = container.clientWidth;
-    const containerH = container.clientHeight;
-    const imgAspect = img.naturalWidth / img.naturalHeight;
-    const containerAspect = containerW / containerH;
-
-    let drawW, drawH;
-    if (imgAspect > containerAspect) {
-      drawW = containerW;
-      drawH = containerW / imgAspect;
-    } else {
-      drawH = containerH;
-      drawW = containerH * imgAspect;
-    }
-
-    screenCanvas.width  = drawW;
-    screenCanvas.height = drawH;
-    screenCanvas.style.width  = drawW + 'px';
-    screenCanvas.style.height = drawH + 'px';
-
-    ctx.drawImage(img, 0, 0, drawW, drawH);
-
-    // Store natural dimensions for input mapping
-    screenCanvas._naturalW = img.naturalWidth;
-    screenCanvas._naturalH = img.naturalHeight;
-  };
-  img.src = `data:image/${frame.format};base64,${frame.data}`;
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Canvas: Input Forwarding (mouse + keyboard)
+// Input Forwarding (mouse + keyboard)
 // ────────────────────────────────────────────────────────────────────────────
 function setupCanvasInput() {
-  screenCanvas.addEventListener('mousemove',  onCanvasMouseMove);
-  screenCanvas.addEventListener('mousedown',  onCanvasMouseDown);
-  screenCanvas.addEventListener('mouseup',    onCanvasMouseUp);
-  screenCanvas.addEventListener('click',      onCanvasClick);
-  screenCanvas.addEventListener('dblclick',   onCanvasDblClick);
-  screenCanvas.addEventListener('wheel',      onCanvasWheel, { passive: false });
-  screenCanvas.addEventListener('contextmenu', onCanvasContextMenu);
+  screenVideo.addEventListener('mousemove',  onCanvasMouseMove);
+  screenVideo.addEventListener('mousedown',  onCanvasMouseDown);
+  screenVideo.addEventListener('mouseup',    onCanvasMouseUp);
+  screenVideo.addEventListener('click',      onCanvasClick);
+  screenVideo.addEventListener('dblclick',   onCanvasDblClick);
+  screenVideo.addEventListener('wheel',      onCanvasWheel, { passive: false });
+  screenVideo.addEventListener('contextmenu', onCanvasContextMenu);
   document.addEventListener('keydown',  onKeyDown);
   document.addEventListener('keyup',    onKeyUp);
 }
 
 function removeCanvasInput() {
-  screenCanvas.removeEventListener('mousemove',  onCanvasMouseMove);
-  screenCanvas.removeEventListener('mousedown',  onCanvasMouseDown);
-  screenCanvas.removeEventListener('mouseup',    onCanvasMouseUp);
-  screenCanvas.removeEventListener('click',      onCanvasClick);
-  screenCanvas.removeEventListener('dblclick',   onCanvasDblClick);
-  screenCanvas.removeEventListener('wheel',      onCanvasWheel);
-  screenCanvas.removeEventListener('contextmenu', onCanvasContextMenu);
+  screenVideo.removeEventListener('mousemove',  onCanvasMouseMove);
+  screenVideo.removeEventListener('mousedown',  onCanvasMouseDown);
+  screenVideo.removeEventListener('mouseup',    onCanvasMouseUp);
+  screenVideo.removeEventListener('click',      onCanvasClick);
+  screenVideo.removeEventListener('dblclick',   onCanvasDblClick);
+  screenVideo.removeEventListener('wheel',      onCanvasWheel);
+  screenVideo.removeEventListener('contextmenu', onCanvasContextMenu);
   document.removeEventListener('keydown',  onKeyDown);
   document.removeEventListener('keyup',    onKeyUp);
 }
 
 function canvasToScreenCoords(e) {
-  const rect = screenCanvas.getBoundingClientRect();
-  const x = e.clientX - rect.left;
-  const y = e.clientY - rect.top;
-  // Natural (host screen) coords, scaled back
-  const nW = screenCanvas._naturalW || screenCanvas.width;
-  const nH = screenCanvas._naturalH || screenCanvas.height;
-  return { x, y, screenW: nW, screenH: nH };
+  // Pakai area konten video yang ter-render (object-fit: contain → hitung letterbox).
+  const rect = screenVideo.getBoundingClientRect();
+  const vW = screenVideo.videoWidth || rect.width;
+  const vH = screenVideo.videoHeight || rect.height;
+  const scale = Math.min(rect.width / vW, rect.height / vH);
+  const dispW = vW * scale, dispH = vH * scale;
+  const offX = (rect.width - dispW) / 2;
+  const offY = (rect.height - dispH) / 2;
+  const x = e.clientX - rect.left - offX;
+  const y = e.clientY - rect.top - offY;
+  return { x, y, screenW: dispW, screenH: dispH };
 }
 
 function getModifiers(e) {
@@ -511,7 +685,7 @@ function getModifiers(e) {
 
 function sendInput(data) {
   if (!state.inputEnabled || !state.clientConnected) return;
-  api.clientSendInput(data);
+  clientViewer.sendInput(data);
 }
 
 let lastMoveTime = 0;

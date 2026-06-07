@@ -70,6 +70,16 @@ function startDetached(cmd, cmdArgs, logFile, pidFile, label) {
 
 /** Path ke biner electron lokal, lintas-platform. */
 function electronBin() {
+  // require('electron') di konteks Node biasa mengembalikan path ke biner
+  // electron asli (electron.exe), BUKAN wrapper electron.cmd. Menjalankan exe
+  // langsung menghindari dua masalah di Windows: (1) EINVAL karena .cmd butuh
+  // shell sejak Node 18.20+/20+/22+ (CVE-2024-27980), dan (2) jendela console
+  // yang muncul karena .cmd dijalankan lewat cmd.exe (aplikasi console) — exe
+  // GUI tidak punya console sehingga tidak ada terminal yang nongol.
+  try {
+    const exe = require('electron');
+    if (typeof exe === 'string' && fs.existsSync(exe)) return exe;
+  } catch { /* fallback di bawah */ }
   const bin = path.join(ROOT, 'node_modules', '.bin', isWin ? 'electron.cmd' : 'electron');
   return fs.existsSync(bin) ? bin : (isWin ? 'electron.cmd' : 'electron');
 }

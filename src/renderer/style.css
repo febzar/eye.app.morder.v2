@@ -747,7 +747,8 @@ html, body {
 .placeholder-content p { font-size: 14px; color: var(--text-secondary); }
 .placeholder-content span { font-size: 11.5px; color: var(--text-muted); }
 
-#screen-canvas {
+#screen-canvas,
+#screen-video {
   width: 100%;
   height: 100%;
   object-fit: contain;

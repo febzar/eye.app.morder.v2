@@ -9,10 +9,12 @@
     "start:client": "electron . --mode=client",
     "dev": "electron . --dev",
     "serve": "node server.js",
-    "serve:bg": "nohup node server.js > morderx.log 2>&1 & echo $! > morderx.pid && echo 'Server berjalan di background. PID:' $(cat morderx.pid)",
-    "serve:stop": "kill $(cat morderx.pid) 2>/dev/null && rm -f morderx.pid && echo 'Server dihentikan'",
-    "serve:log": "tail -f morderx.log",
-    "serve:status": "ps aux | grep 'node server.js' | grep -v grep || echo 'Server tidak berjalan'",
+    "serve:bg": "node scripts/serve.js start",
+    "serve:stop": "node scripts/serve.js stop",
+    "serve:log": "node scripts/serve.js log",
+    "serve:status": "node scripts/serve.js status",
+    "serve:auto": "electron . --auto-host --no-open",
+    "serve:auto:bg": "node scripts/serve.js auto",
     "pm2:start": "pm2 start server.js --name morderx",
     "pm2:stop": "pm2 stop morderx",
     "pm2:restart": "pm2 restart morderx",
@@ -33,14 +35,14 @@
   "author": "Morderx",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^28.3.3",
-    "electron-builder": "^24.13.3"
+    "electron": "^42.3.3",
+    "electron-builder": "^26.15.0"
   },
   "dependencies": {
+    "@jitsi/robotjs": "^0.6.22",
     "bonjour-service": "^1.2.1",
     "jimp": "^0.22.12",
     "node-fetch": "^2.7.0",
-    "robotjs": "^0.6.0",
     "screenshot-desktop": "^1.15.4",
     "uuid": "^9.0.1",
     "ws": "^8.20.0"

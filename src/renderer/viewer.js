@@ -1,6 +1,6 @@
 /**
- * Morderx — Browser Viewer Logic
- * WebSocket client: auth, frame rendering, input forwarding.
+ * Morderx — Browser Viewer (WebRTC)
+ * Menerima video layar host via WebRTC dan meneruskan input lewat WebSocket.
  */
 'use strict';
 
@@ -13,8 +13,7 @@ const authToggle   = document.getElementById('auth-pass-toggle');
 
 const viewerWrap   = document.getElementById('viewer-wrap');
 const placeholder  = document.getElementById('placeholder');
-const canvas       = document.getElementById('screen-canvas');
-const ctx          = canvas.getContext('2d');
+const video        = document.getElementById('screen-video');
 
 const stFps        = document.getElementById('st-fps');
 const stPing       = document.getElementById('st-ping');
@@ -25,12 +24,11 @@ const btnFs        = document.getElementById('btn-fullscreen');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let ws           = null;
+let pc           = null;
 let inputEnabled = true;
-let frameCount   = 0;
-let lastFpsTime  = Date.now();
 
-// ── WebSocket URL (same host, same port) ──────────────────────────────────────
 const WS_URL = `ws://${location.host}`;
+const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
 // ── Auth UI ───────────────────────────────────────────────────────────────────
 authToggle.addEventListener('click', () => {
@@ -48,38 +46,42 @@ function connect() {
 
   ws = new WebSocket(WS_URL);
 
-  ws.addEventListener('open', () => {
-    // Wait for auth-required from server
-  });
+  ws.addEventListener('message', async (ev) => {
+    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
 
-  ws.addEventListener('message', (ev) => {
-    try {
-      const msg = JSON.parse(ev.data);
-      switch (msg.type) {
-        case 'auth-required':
-          ws.send(JSON.stringify({ type: 'auth', password: authPass.value }));
-          break;
+    switch (msg.type) {
+      case 'auth-required':
+        ws.send(JSON.stringify({ type: 'auth', role: 'viewer', password: authPass.value }));
+        break;
 
-        case 'auth-ok':
-          onConnected(msg);
-          break;
+      case 'auth-ok':
+        onConnected(msg);
+        if (!msg.hostOnline) showToast('Host belum membagikan layar. Menunggu...', 'info');
+        break;
 
-        case 'auth-failed':
-          authError.style.display = 'block';
-          authBtn.disabled = false;
-          authBtn.textContent = 'Hubungkan';
-          ws.close();
-          break;
+      case 'auth-failed':
+        authError.style.display = 'block';
+        authBtn.disabled = false;
+        authBtn.textContent = 'Hubungkan';
+        ws.close();
+        break;
 
-        case 'frame':
-          renderFrame(msg);
-          break;
+      case 'no-host':
+        showPlaceholder('Menunggu host membagikan layar...');
+        break;
 
-        case 'pong':
-          stPing.textContent = (Date.now() - msg.ts) + ' ms';
-          break;
-      }
-    } catch (e) { /* ignore */ }
+      case 'viewer-count':
+        viewerCount.textContent = `${msg.count} viewer`;
+        break;
+
+      case 'signal':
+        await handleSignal(msg.signal);
+        break;
+
+      case 'pong':
+        stPing.textContent = (Date.now() - msg.ts) + ' ms';
+        break;
+    }
   });
 
   ws.addEventListener('close', () => {
@@ -95,6 +97,79 @@ function connect() {
   });
 }
 
+// ── WebRTC ──────────────────────────────────────────────────────────────────────
+function ensurePeer() {
+  if (pc) return pc;
+  pc = new RTCPeerConnection(ICE);
+
+  pc.ontrack = (e) => {
+    video.srcObject = e.streams[0];
+    video.play().catch(() => {});
+    placeholder.style.display = 'none';
+    video.style.display = 'block';
+    startFpsMeter();
+  };
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) ws.send(JSON.stringify({ type: 'signal', signal: { candidate: e.candidate } }));
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+      showPlaceholder('Koneksi video terputus, menunggu host...');
+    }
+  };
+
+  return pc;
+}
+
+async function handleSignal(signal) {
+  const peer = ensurePeer();
+  if (signal.sdp) {
+    await peer.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+    if (signal.sdp.type === 'offer') {
+      const answer = await peer.createAnswer();
+      await peer.setLocalDescription(answer);
+      ws.send(JSON.stringify({ type: 'signal', signal: { sdp: peer.localDescription } }));
+    }
+  } else if (signal.candidate) {
+    try { await peer.addIceCandidate(signal.candidate); } catch { /* ignore */ }
+  }
+}
+
+function showPlaceholder(text) {
+  video.style.display = 'none';
+  placeholder.style.display = 'flex';
+  const p = placeholder.querySelector('p');
+  if (p) p.textContent = text;
+}
+
+// ── FPS meter (requestVideoFrameCallback) ─────────────────────────────────────────
+let fpsFrames = 0;
+let fpsLast = Date.now();
+let fpsStarted = false;
+
+function startFpsMeter() {
+  if (fpsStarted) return;
+  fpsStarted = true;
+
+  if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+    const tick = () => {
+      fpsFrames++;
+      const now = Date.now();
+      if (now - fpsLast >= 1000) { stFps.textContent = fpsFrames; fpsFrames = 0; fpsLast = now; }
+      video.requestVideoFrameCallback(tick);
+    };
+    video.requestVideoFrameCallback(tick);
+  } else {
+    // Fallback: tampilkan frameRate dari track settings
+    setInterval(() => {
+      const tr = video.srcObject && video.srcObject.getVideoTracks()[0];
+      if (tr) stFps.textContent = Math.round(tr.getSettings().frameRate || 0);
+    }, 1000);
+  }
+}
+
 // ── Connected ─────────────────────────────────────────────────────────────────
 function onConnected(msg) {
   authOverlay.style.display = 'none';
@@ -102,57 +177,14 @@ function onConnected(msg) {
 
   const firstIP = msg.ips && msg.ips[0] ? msg.ips[0].address : location.hostname;
   stHost.textContent = msg.hostname || firstIP;
-  viewerCount.textContent = `${msg.viewerCount} viewer`;
 
-  showToast('Terhubung ke host!', 'success');
+  showToast('Terhubung ke server!', 'success');
 
-  // Start ping loop
   setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
-    }
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
   }, 3000);
 
-  // Setup input events on canvas
   setupInput();
-}
-
-// ── Frame Rendering ───────────────────────────────────────────────────────────
-function renderFrame(msg) {
-  // FPS counter
-  frameCount++;
-  const now = Date.now();
-  if (now - lastFpsTime >= 1000) {
-    stFps.textContent = frameCount;
-    frameCount  = 0;
-    lastFpsTime = now;
-  }
-
-  const img = new Image();
-  img.onload = () => {
-    const wrap = document.getElementById('canvas-wrap');
-    const cw   = wrap.clientWidth;
-    const ch   = wrap.clientHeight;
-    const ar   = img.naturalWidth / img.naturalHeight;
-    const car  = cw / ch;
-
-    let dw, dh;
-    if (ar > car) { dw = cw; dh = cw / ar; }
-    else          { dh = ch; dw = ch * ar; }
-
-    canvas.width         = dw;
-    canvas.height        = dh;
-    canvas.style.width   = dw + 'px';
-    canvas.style.height  = dh + 'px';
-    canvas._nw = img.naturalWidth;
-    canvas._nh = img.naturalHeight;
-    ctx.drawImage(img, 0, 0, dw, dh);
-
-    // Show canvas, hide placeholder
-    placeholder.style.display = 'none';
-    canvas.style.display = 'block';
-  };
-  img.src = `data:image/${msg.format};base64,${msg.data}`;
 }
 
 // ── Input Forwarding ──────────────────────────────────────────────────────────
@@ -161,9 +193,14 @@ function sendInput(data) {
   ws.send(JSON.stringify({ type: 'input', data }));
 }
 
-function canvasCoords(e) {
-  const r  = canvas.getBoundingClientRect();
-  return { x: e.clientX - r.left, y: e.clientY - r.top, screenW: canvas._nw || canvas.width, screenH: canvas._nh || canvas.height };
+function videoCoords(e) {
+  const r  = video.getBoundingClientRect();
+  return {
+    x: e.clientX - r.left,
+    y: e.clientY - r.top,
+    screenW: r.width,
+    screenH: r.height,
+  };
 }
 
 function mods(e) {
@@ -171,41 +208,31 @@ function mods(e) {
 }
 
 let lastMove = 0;
-const KEY_MAP = {
-  'Enter':'enter','Tab':'tab','Escape':'escape','Backspace':'backspace','Delete':'delete',
-  'ArrowUp':'up','ArrowDown':'down','ArrowLeft':'left','ArrowRight':'right',
-  'Home':'home','End':'end','PageUp':'pageup','PageDown':'pagedown',
-  'F1':'f1','F2':'f2','F3':'f3','F4':'f4','F5':'f5','F6':'f6',
-  'F7':'f7','F8':'f8','F9':'f9','F10':'f10','F11':'f11','F12':'f12',
-  'Control':'control','Shift':'shift','Alt':'alt','Meta':'command',' ':'space',
-};
-const mapKey = (k) => KEY_MAP[k] || (k.length === 1 ? k.toLowerCase() : null);
-const mapBtn = (b) => b === 2 ? 'right' : b === 1 ? 'middle' : 'left';
 
 function setupInput() {
-  canvas.addEventListener('mousemove', (e) => {
+  video.addEventListener('mousemove', (e) => {
     const now = Date.now(); if (now - lastMove < 30) return; lastMove = now;
-    const c = canvasCoords(e);
-    sendInput({ type: 'mousemove', ...c });
+    sendInput({ type: 'mousemove', ...videoCoords(e) });
   });
-  canvas.addEventListener('mousedown',   (e) => { e.preventDefault(); sendInput({ type: 'mousedown',   ...canvasCoords(e), button: e.button }); });
-  canvas.addEventListener('mouseup',     (e) => sendInput({ type: 'mouseup',     ...canvasCoords(e), button: e.button }));
-  canvas.addEventListener('click',       (e) => sendInput({ type: 'click',       ...canvasCoords(e), button: e.button }));
-  canvas.addEventListener('dblclick',    (e) => sendInput({ type: 'click',       ...canvasCoords(e), button: e.button, double: true }));
-  canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); sendInput({ type: 'click', ...canvasCoords(e), button: 2 }); });
-  canvas.addEventListener('wheel',       (e) => { e.preventDefault(); sendInput({ type: 'scroll', ...canvasCoords(e), deltaX: e.deltaX, deltaY: e.deltaY }); }, { passive: false });
+  video.addEventListener('mousedown',   (e) => { e.preventDefault(); sendInput({ type: 'mousedown', ...videoCoords(e), button: e.button }); });
+  video.addEventListener('mouseup',     (e) => sendInput({ type: 'mouseup',   ...videoCoords(e), button: e.button }));
+  video.addEventListener('click',       (e) => sendInput({ type: 'click',     ...videoCoords(e), button: e.button }));
+  video.addEventListener('dblclick',    (e) => sendInput({ type: 'click',     ...videoCoords(e), button: e.button, double: true }));
+  video.addEventListener('contextmenu', (e) => { e.preventDefault(); sendInput({ type: 'click', ...videoCoords(e), button: 2 }); });
+  video.addEventListener('wheel',       (e) => { e.preventDefault(); sendInput({ type: 'scroll', ...videoCoords(e), deltaX: e.deltaX, deltaY: e.deltaY }); }, { passive: false });
 
   document.addEventListener('keydown', (e) => {
     if (!inputEnabled) return;
     if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
-    const key = mapKey(e.key);
-    if (key) { e.preventDefault(); sendInput({ type: 'keydown', key, code: e.code, modifiers: mods(e) }); }
+    // Kirim e.key mentah; pemetaan ke nama robotjs dilakukan di host (input.js).
+    e.preventDefault();
+    sendInput({ type: 'keydown', key: e.key, code: e.code, modifiers: mods(e) });
   });
   document.addEventListener('keyup', (e) => {
     if (!inputEnabled) return;
     if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
-    const key = mapKey(e.key);
-    if (key) { e.preventDefault(); sendInput({ type: 'keyup', key, code: e.code, modifiers: mods(e) }); }
+    e.preventDefault();
+    sendInput({ type: 'keyup', key: e.key, code: e.code, modifiers: mods(e) });
   });
 }
 
@@ -215,12 +242,12 @@ btnInput.addEventListener('click', () => {
   if (inputEnabled) {
     btnInput.classList.add('active');
     btnInput.lastChild.textContent = ' Kontrol Aktif';
-    canvas.style.cursor = 'crosshair';
+    video.style.cursor = 'crosshair';
     showToast('Kontrol input aktif', 'success');
   } else {
     btnInput.classList.remove('active');
     btnInput.lastChild.textContent = ' Kontrol Nonaktif';
-    canvas.style.cursor = 'default';
+    video.style.cursor = 'default';
     showToast('Kontrol input nonaktif', 'info');
   }
 });
